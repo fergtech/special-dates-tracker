@@ -6,13 +6,21 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 from flask_migrate import Migrate
+import json
 
 #load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
+
+database_url = os.getenv('DATABASE_URL')
+if database_url:
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+else:
+    database_url = "sqlite:///app.db"
+
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -33,6 +41,10 @@ class User(UserMixin, db.Model):
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
+    
+class Calendar(db.Model):
+    date = db.Column(db.String, primary_key=True, unique=True)
+    events = db.Column(db.JSON, nullable=True)
 
 class SpecialDate(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -101,7 +113,7 @@ def login():
 @login_required
 def dashboard():
     dates = SpecialDate.query.filter_by(user_id=current_user.id).order_by(SpecialDate.date).all()
-    return render_template('dashboard.html', dates=dates)
+    return render_template('dashboard.html', dates=dates, calendar_dates=get_events())
 
 @app.route('/add_date', methods=['GET', 'POST'])
 @login_required
@@ -121,7 +133,12 @@ def add_date():
             category=category,
             user_id=current_user.id
         )
-        
+
+        update_entry('add', {
+                    'title': title,
+                    'date': date_str,
+                })
+
         db.session.add(special_date)
         db.session.commit()
         
@@ -129,6 +146,60 @@ def add_date():
         return redirect(url_for('dashboard'))
     
     return render_template('add_date.html')
+
+@app.route('/remove_date/<int:date_id>', methods=['POST'])
+@login_required
+def remove_date(date_id):
+    special_date = SpecialDate.query.get_or_404(date_id)
+
+    if special_date.user_id != current_user.id:
+        print("Unauthorized deletion attempt")
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    removed_date = special_date.date.strftime('%Y-%m-%d')
+    WishlistItem.query.filter_by(special_date_id=date_id).delete()
+
+    update_entry('remove', {
+        'title': special_date.title,
+        'date': removed_date
+    })
+
+    db.session.delete(special_date)
+    db.session.commit()
+
+    print(f"Successfully removed event ID {date_id} from DB")
+    return jsonify({'success': True, 'removed_date': removed_date})
+
+def update_entry(operation, event):
+    date = event['date']
+    title = event['title']
+    check_date = Calendar.query.filter_by(date=date).first()
+    
+    if operation == 'add':
+        if check_date is None:
+            new_entry = Calendar(
+                date=date,
+                events=json.dumps({title: event})
+            )
+            db.session.add(new_entry)
+        else:
+            current_events = json.loads(check_date.events) if check_date.events else {}
+            current_events[title] = event
+            check_date.events = json.dumps(current_events)
+        db.session.commit()
+    
+    elif operation == 'remove':
+        if check_date:
+            current_events = json.loads(check_date.events) if check_date.events else {}
+            current_events.pop(title, None)
+            if current_events:
+                check_date.events = json.dumps(current_events)
+            else:
+                db.session.delete(check_date)
+            db.session.commit()
+
+def get_events():
+     return [entry.date for entry in Calendar.query.all() if entry.events]
 
 @app.route('/add_wishlist_item/<int:date_id>', methods=['POST'])
 @login_required
